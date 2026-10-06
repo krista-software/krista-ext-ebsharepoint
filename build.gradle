@@ -1,0 +1,234 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'jacoco'
+    id("org.sonarqube") version "6.3.1.5724"
+}
+
+group 'app.krista.extensions.Essentials.CloudFiles'
+
+ext {
+    kristaApisVersion = '1.0.125-sp1'
+}
+
+def computedBaseName = "ebsharepoint-extension"
+def computedVersion = "local"
+
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+            println "Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenLocal()
+    maven { url "https://packages.cicd.in.antbrains.com/artifactory/libs-release" }
+    mavenCentral()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:all,-serial'
+}
+
+configurations {
+    implementation {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+    sdkUi { canBeResolved = true; transitive = false }
+}
+
+dependencies {
+    // --- CORE ---
+    annotationProcessor 'app.krista:extension-impl-anno-processors:1.0.125-sp1'
+    implementation 'app.krista:krista-apis:1.0.125-sp1'
+    implementation 'org.glassfish.hk2:hk2-api:3.0.3'
+
+    // --- Integration ---
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // --- Microsoft-auth-SDK (Pattern D) ---
+    implementation 'app.krista.sdk:microsoft-auth-sdk:1.0.8'
+    implementation 'com.microsoft.graph:microsoft-graph:5.80.0'
+    implementation 'com.microsoft.graph:microsoft-graph-auth:0.3.0'
+    implementation 'com.azure:azure-identity:1.11.2'
+    sdkUi 'app.krista.sdk:microsoft-auth-sdk:1.0.8'
+
+    // --- Testing ---
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.mockito:mockito-core:5.8.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.8.0'
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            afterEvaluate {
+                artifactId = jar.archiveBaseName.get()
+                groupId = rootProject.group
+            }
+        }
+    }
+    repositories {
+        mavenLocal()
+        maven {
+            credentials {
+                username = project.findProperty('MAVEN_USERNAME')
+                password = project.findProperty('MAVEN_PASSWORD')
+            }
+            authentication { basic(BasicAuthentication) }
+            url project.findProperty('MAVEN_UPLOAD_URL') ?: mavenLocal().url
+        }
+    }
+}
+
+jacoco {
+    toolVersion = "0.8.12"
+}
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+sonar {
+    properties {
+        property("sonar.projectName", "SonarScanner for EB Sharepoint (JaCoCo coverage)")
+        property("sonar.projectKey", "sonar-scanner-ebsharepoint")
+        property("sonar.sources", "src/main/java")
+        property("sonar.tests", "src/test/java")
+        property("sonar.java.binaries", "build/classes/java/main")
+        property("sonar.java.test.binaries", "build/classes/java/test")
+        property("sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/test/jacocoTestReport.xml")
+        property("sonar.junit.reportPaths", "build/test-results/test")
+    }
+}
+tasks.named("sonar") { dependsOn jacocoTestReport }
+
+import java.util.regex.Pattern
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties from @Extension and @Domain annotations'
+    doLast {
+        def extensionFilePath = 'src/main/java/app/krista/extensions/essentials/cloudfiles/ebsharepoint/EBSharepointExtension.java'
+        def areaFilePath = 'src/main/java/app/krista/extensions/essentials/cloudfiles/ebsharepoint/catalog/SetupArea.java'
+        def extensionFile = project.file(extensionFilePath)
+        def areaFile = project.file(areaFilePath)
+        if (!extensionFile.exists()) { throw new GradleException("Extension file not found: ${extensionFilePath}") }
+        if (!areaFile.exists()) { throw new GradleException("Area file not found: ${areaFilePath}") }
+
+        def properties = new Properties()
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") { properties.setProperty("extension.version", value) }
+            else if (key == "name") { properties.setProperty("extension.name", value) }
+        }
+        extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") { properties.setProperty("domain.name", value) }
+            else if (key == "ecosystemName") { properties.setProperty("ecosystem.name", value) }
+        }
+
+        if (!properties.getProperty('extension.name')) { properties.setProperty("extension.name", "EB Sharepoint") }
+        if (!properties.getProperty('extension.version')) { throw new GradleException("Could not find extension version in ${extensionFilePath}") }
+        if (!properties.getProperty('domain.name')) { properties.setProperty("domain.name", "Cloud Files") }
+        if (!properties.getProperty('ecosystem.name')) { properties.setProperty("ecosystem.name", "Essentials") }
+
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties:\n${content}")
+    }
+}
+
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) { inAnnotation = true; annotationText.setLength(0); annotationText.append(line) }
+        else if (inAnnotation) { annotationText.append(line) }
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) { processProperty.call(matcher.group(1), matcher.group(2)) }
+        }
+    }
+}
+
+tasks.register('createSourceDir', Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+tasks.register('copyGradleFile', Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+tasks.register('includeSources', Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+// Microsoft-auth-SDK ships pre-built tab HTML inside its jar; extract it into build/resources/main.
+tasks.register('extractSDKResources', Copy) {
+    def sdkJar = configurations.sdkUi.singleFile
+    from(zipTree(sdkJar)) {
+        include 'auth/index.html'
+        include 'audit/index.html'
+    }
+    into("${project.buildDir}/resources/main")
+    includeEmptyDirs = false
+}
+tasks.named('processResources') { dependsOn(tasks.named('extractSDKResources')) }
+tasks.named('compileTestJava') { dependsOn(tasks.named('extractSDKResources')) }
+
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+    dependsOn tasks.named("extractSDKResources")
+}
+
+jar {
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn includeSources
+    archiveBaseName = project.ext.has("finalBaseName") ? project.ext.finalBaseName : "ebsharepoint-extension"
+    manifest {}
+    from { configurations.implementation.collect { it.isDirectory() ? it : zipTree(it) } }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+    finalizedBy jacocoTestReport
+}
